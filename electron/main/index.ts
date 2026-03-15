@@ -21,6 +21,12 @@ import { autoInstallCliIfNeeded, generateCompletionCache, installCompletionToPro
 import { isQuitting, setQuitting } from './app-state';
 import { applyProxySettings } from './proxy';
 import { syncLaunchAtStartupSettingFromStore } from './launch-at-startup';
+import {
+  clearPendingSecondInstanceFocus,
+  consumeMainWindowReady,
+  createMainWindowFocusState,
+  requestSecondInstanceFocus,
+} from './main-window-focus';
 import { getSetting } from '../utils/store';
 import { ensureBuiltinSkillsInstalled, ensurePreinstalledSkillsInstalled } from '../utils/skill-config';
 import { startHostApiServer } from '../api/server';
@@ -72,6 +78,7 @@ let gatewayManager!: GatewayManager;
 let clawHubService!: ClawHubService;
 let hostEventBus!: HostEventBus;
 let hostApiServer: Server | null = null;
+const mainWindowFocusState = createMainWindowFocusState();
 
 /**
  * Resolve the icons directory path (works in both dev and packaged mode)
@@ -125,11 +132,6 @@ function createWindow(): BrowserWindow {
     show: false,
   });
 
-  // Show window when ready to prevent visual flash
-  win.once('ready-to-show', () => {
-    win.show();
-  });
-
   // Handle external links
   win.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
@@ -147,17 +149,60 @@ function createWindow(): BrowserWindow {
   return win;
 }
 
+function focusWindow(win: BrowserWindow): void {
+  if (win.isDestroyed()) {
+    return;
+  }
+
+  if (win.isMinimized()) {
+    win.restore();
+  }
+
+  win.show();
+  win.focus();
+}
+
 function focusMainWindow(): void {
   if (!mainWindow || mainWindow.isDestroyed()) {
     return;
   }
 
-  if (mainWindow.isMinimized()) {
-    mainWindow.restore();
-  }
+  clearPendingSecondInstanceFocus(mainWindowFocusState);
+  focusWindow(mainWindow);
+}
 
-  mainWindow.show();
-  mainWindow.focus();
+function createMainWindow(): BrowserWindow {
+  const win = createWindow();
+
+  win.once('ready-to-show', () => {
+    if (mainWindow !== win) {
+      return;
+    }
+
+    const action = consumeMainWindowReady(mainWindowFocusState);
+    if (action === 'focus') {
+      focusWindow(win);
+      return;
+    }
+
+    win.show();
+  });
+
+  win.on('close', (event) => {
+    if (!isQuitting()) {
+      event.preventDefault();
+      win.hide();
+    }
+  });
+
+  win.on('closed', () => {
+    if (mainWindow === win) {
+      mainWindow = null;
+    }
+  });
+
+  mainWindow = win;
+  return win;
 }
 
 /**
@@ -185,10 +230,10 @@ async function initialize(): Promise<void> {
   createMenu();
 
   // Create the main window
-  mainWindow = createWindow();
+  const window = createMainWindow();
 
   // Create system tray
-  createTray(mainWindow);
+  createTray(window);
 
   // Override security headers ONLY for the OpenClaw Gateway Control UI.
   // The URL filter ensures this callback only fires for gateway requests,
@@ -214,32 +259,20 @@ async function initialize(): Promise<void> {
   );
 
   // Register IPC handlers
-  registerIpcHandlers(gatewayManager, clawHubService, mainWindow);
+  registerIpcHandlers(gatewayManager, clawHubService, window);
 
   hostApiServer = startHostApiServer({
     gatewayManager,
     clawHubService,
     eventBus: hostEventBus,
-    mainWindow,
+    mainWindow: window,
   });
 
   // Register update handlers
-  registerUpdateHandlers(appUpdater, mainWindow);
+  registerUpdateHandlers(appUpdater, window);
 
   // Note: Auto-check for updates is driven by the renderer (update store init)
   // so it respects the user's "Auto-check for updates" setting.
-
-  // Minimize to tray on close instead of quitting (macOS & Windows)
-  mainWindow.on('close', (event) => {
-    if (!isQuitting()) {
-      event.preventDefault();
-      mainWindow?.hide();
-    }
-  });
-
-  mainWindow.on('closed', () => {
-    mainWindow = null;
-  });
 
   // Repair any bootstrap files that only contain ClawX markers (no OpenClaw
   // template content). This fixes a race condition where ensureClawXContext()
@@ -383,16 +416,17 @@ if (gotTheLock) {
   app.on('second-instance', () => {
     logger.info('Second ClawX instance detected; redirecting to the existing window');
 
-    if (mainWindow) {
+    const focusRequest = requestSecondInstanceFocus(
+      mainWindowFocusState,
+      Boolean(mainWindow && !mainWindow.isDestroyed()),
+    );
+
+    if (focusRequest === 'focus-now') {
       focusMainWindow();
       return;
     }
 
-    if (!app.isReady()) {
-      app.once('browser-window-created', () => {
-        focusMainWindow();
-      });
-    }
+    logger.debug('Main window is not ready yet; deferring second-instance focus until ready-to-show');
   });
 
   // Application lifecycle
@@ -405,7 +439,7 @@ if (gotTheLock) {
     // "Cannot create BrowserWindow before app is ready" on macOS.
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) {
-        mainWindow = createWindow();
+        createMainWindow();
       } else {
         focusMainWindow();
       }
